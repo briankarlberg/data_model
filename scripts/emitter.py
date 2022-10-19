@@ -21,6 +21,7 @@ import psycopg2
 import yaml
 from dictionaryutils import DataDictionary, dictionary, dump_schemas_from_dir
 from fhirclient.models.bundle import Bundle
+from fhirclient.models.coding import Coding
 from fhirclient.models.fhirreference import FHIRReference
 from flatten_json import flatten
 from pelican.dictionary import DataDictionaryTraversal
@@ -404,10 +405,6 @@ class DictionaryEmitter(Emitter):
     def flatten_embedded_property(self, name, jsname, typ, is_list, of_many, not_optional, docstrings, depth_counter=0,
                                   parent_name=None):
         """Flatten a complex type."""
-        # maximum depth, prevent RecursionError
-        if depth_counter == 3:
-            return
-        depth_counter += 1
 
         # ignore anything that is redacted
         for path in self._redacted_classes:
@@ -421,57 +418,8 @@ class DictionaryEmitter(Emitter):
 
         resource = typ()
         # iterate through children
-
-        # max 2
-        range_limit = 2
-        if is_list:
-            range_limit = 1
-
-        for list_counter in range(range_limit):
-            is_first = True
-            for c_name, c_jsname, c_typ, c_is_list, c_of_many, c_not_optional in self.resource_properties(resource):
-                # TODO add to model config
-                if c_name in ['id', 'resource_type']:
-                    continue
-                # TODO add to model config
-                if typ.__name__ == 'Identifier' and c_name not in ['system', 'value', 'use']:
-                    continue
-                # TODO add to model config
-                if typ.__name__ == 'Reference' and c_name not in ['reference', 'type']:
-                    continue
-
-                if c_name in self.model.ignored_properties:
-                    continue
-                c_docstring = ''
-                if c_name in resource.attribute_docstrings():
-                    c_docstring = resource.attribute_docstrings()[c_name]
-                c_docstrings = [c_docstring]
-                if is_first:
-                    is_first = False
-                    c_docstrings = docstrings + c_docstrings
-
-                if parent_name:
-                    property_name = parent_name
-                else:
-                    property_name = name
-                if is_list:
-                    property_name = f"{property_name}_{list_counter}_{c_name}"
-                else:
-                    property_name = f"{property_name}_{c_name}"
-
-                if c_typ.__name__ not in DictionaryEmitter.ALL_MAPPED_TYPES:
-                    # msg = f"Expand child {c_name} {c_typ.__name__} parent {typ.__name__}"
-                    # if first_occurrence(msg):
-                    #     logger.warning(msg)
-                    # expand embedded type
-                    for expanded in self.flatten_embedded_property(c_name, c_jsname, c_typ, c_is_list, c_of_many,
-                                                                   c_not_optional, c_docstrings, depth_counter,
-                                                                   parent_name=property_name):
-                        yield expanded
-                    continue
-
-                schema_property = self.create_schema_property(c_docstrings, c_name, c_not_optional, resource, c_typ)
-                yield _normalize_property_name(property_name), schema_property
+        schema_property = self.create_schema_property(docstrings, name, not_optional, resource, typ, is_list=is_list)
+        yield _normalize_property_name(name), schema_property
 
     def render_property(self, entity, resource) -> tuple[str, dict]:
         """Render the property type and description."""
@@ -495,20 +443,31 @@ class DictionaryEmitter(Emitter):
                     yield expanded
                 continue
 
-            schema_property = self.create_schema_property(docstrings, name, not_optional, resource, typ)
+            schema_property = self.create_schema_property(docstrings, name, not_optional, resource, typ, is_list)
 
             yield _normalize_property_name(name), schema_property
 
     @staticmethod
-    def create_schema_property(docstrings, name, not_optional, resource, typ):
+    def create_schema_property(docstrings, name, not_optional, resource, typ, is_list):
 
         type_codes = [DictionaryEmitter.normalize_type(typ.__name__, property_name=name,
                                                        resource_type=resource.__class__.__name__)]
-        if not not_optional:
+
+        if not is_list and not not_optional:
             type_codes.append('null')
+
         schema_property = {
             'type': type_codes, 'description': '. '.join(docstrings)
         }
+        if is_list:
+            schema_property = {
+                'type': 'array', 'description': '. '.join(docstrings), 'items': {'type': type_codes[0]}
+            }
+        if isinstance(type_codes[0], dict):
+            schema_property = {
+                'type': 'array', 'description': '. '.join(docstrings), 'items': type_codes[0]
+            }
+
         if name in resource.attribute_enums():
             property_enum = AttributeEnum(**resource.attribute_enums()[name])
 
@@ -564,10 +523,10 @@ class DictionaryEmitter(Emitter):
             return "number"
         if code in DictionaryEmitter.BOOLEAN_TYPES:
             return 'boolean'
-        msg = f"No mapping for {code} default to string {resource_type}.{property_name}"
+        msg = f"No mapping for {code} default to object {resource_type}.{property_name}"
         if first_occurrence(msg):
             logger.warning(msg)
-        return 'string'
+        return {'$ref': "_definitions.yaml#/fhir_resource"}
 
     @staticmethod
     def description(property_) -> List[str]:
@@ -638,15 +597,17 @@ class TransformerEmitter(Emitter):
             self.open_files[path] = open(path, "w")
 
         resource_model = self._data_dictionary[f"{type(resource).__name__}.yaml"]
-        flattened = {k: v for k, v in flatten(resource.as_json(), separator='_').items() if
-                     k in resource_model['properties'].keys()}
+        # flattened = {k: v for k, v in flatten(resource.as_json(), separator='_').items() if
+        #              k in resource_model['properties'].keys()}
+        object_ = {k: v for k, v in resource.as_json().items() if k in resource_model['properties'].keys()}
+
         id_ = resource.id
         json.dump(
             {
                 'id': id_,
                 "name": type(resource).__name__,
                 'relations': [lnk.dict() for lnk in links],
-                'object': flattened
+                'object': object_
             },
             self.open_files[path])
         self.open_files[path].write('\n')
@@ -708,9 +669,9 @@ class TransformerEmitter(Emitter):
         for link in links:
             if link.ignore:
                 continue
-            if len([tp for tp in link.targetProfile if tp.split('/')[-1] in ['Coding', 'CodeableConcept']]) > 0:
-                links_to_return.extend(self.extract_resource(resource, link))
-                continue
+            # if len([tp for tp in link.targetProfile if tp.split('/')[-1] in ['Coding', 'CodeableConcept']]) > 0:
+            #     links_to_return.extend(self.extract_resource(resource, link))
+            #     continue
             link_id = link.id
             if link_id not in vars(resource):
                 link_id = link_id + "_fhir"
