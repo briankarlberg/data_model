@@ -1,5 +1,5 @@
 # CLI processor
-Click==8.1.3
+Click
 
 # our fork of pelican that supports 3.9
 git+https://github.com/ACED-IDP/pelican.git@chore/python-version
@@ -10,11 +10,11 @@ git+https://github.com/ACED-IDP/pelican.git@chore/python-version
 psycopg2
 
 # fhirclient
--e git+https://github.com/bmeg/client-py.git@25d9506696beb212d173b70788c1bcf10e30e9c9#egg=fhirclientr4e
+#-e git+https://github.com/bmeg/client-py.git@25d9506696beb212d173b70788c1bcf10e30e9c9#egg=fhirclientr4e
 
 # pluralization
 inflection
 
-PyYAML==6.0
+PyYAML
 
 pydantic
