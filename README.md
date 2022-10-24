@@ -26,6 +26,11 @@ python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
 pip install numpy cython
+```
+
+If MacOSX, install postgresql `brew install postgresql` prior to install requirements.txt
+
+```commandline
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
 cp -r output coherent
@@ -41,7 +46,7 @@ python3 scripts/transform.py
 # create the pfb
 python3 scripts/pfb.py | sh
 # create figures
-./scripts/visualize.sh 
+./scripts/visualize.sh
 
 ```
 
@@ -53,12 +58,11 @@ python3 scripts/pfb.py | sh
     ...
     copied png files to docs/
     ```
- 
+
 * Test the data
-    
+
     ```commandline
     pytest tests/integration/
     ```
 
 * See [data model](data_model.md)
-
