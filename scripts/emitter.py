@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 import abc
+import asyncio
 import base64
 import collections
 import importlib
 import io
 import json
 import logging
-import multiprocessing
 import os
 import pathlib
 import urllib
 import uuid
 from collections import defaultdict
 from copy import deepcopy
-from datetime import datetime, time
+from datetime import datetime
 from itertools import islice
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, OrderedDict, Any, ClassVar, IO
@@ -34,7 +34,6 @@ from flatten_json import flatten
 from gen3.auth import Gen3Auth
 from gen3.file import Gen3File
 from gen3.index import Gen3Index
-from gen3.submission import Gen3Submission
 from pelican.dictionary import DataDictionaryTraversal
 from pydantic import BaseModel, PrivateAttr
 
@@ -1147,8 +1146,26 @@ def extract_endpoint(gen3_credentials_file):
         return claims['iss'].replace('/user', '')
 
 
-def upload_document_reference_and_decorate(document_reference, bucket_name, file_client, index_client, program,
-                                           project):
+async def upload_document_reference_and_decorate(records, bucket_name, program,
+                                                 project, credentials_file):
+    """Write to indexd."""
+    endpoint = extract_endpoint(credentials_file)
+    logger.info(endpoint)
+    logger.debug(f"Read {credentials_file} endpoint {endpoint}")
+    auth = Gen3Auth(endpoint, refresh_file=credentials_file)
+    file_client = Gen3File(endpoint, auth)
+    index_client = Gen3Index(endpoint, auth)
+    for record in records:
+        document_reference = record['object']
+        decorated = upload_document_reference_and_decorate_record(document_reference, bucket_name,
+                                                                  program,
+                                                                  project, file_client, index_client)
+        record['object'] = decorated
+        yield record
+
+
+async def upload_document_reference_and_decorate_record(document_reference, bucket_name, program,
+                                                        project, file_client, index_client):
     """Write to indexd."""
 
     # map fields hard coded by windmill portal
@@ -1172,6 +1189,7 @@ def upload_document_reference_and_decorate(document_reference, bucket_name, file
     object_name = document_reference['file_name'].lstrip('./')
 
     # create a record in gen3, get a signed url
+    # synchronous call to get url and guid
     document = file_client.upload_file(object_name, bucket=bucket_name)
     assert 'guid' in document, document
     assert 'url' in document, document
@@ -1186,6 +1204,7 @@ def upload_document_reference_and_decorate(document_reference, bucket_name, file
         },
         **hashes}
 
+    # TODO make this async
     with open(document_reference['file_name'], 'rb') as data_f:
         # When you use this header, Amazon S3 checks the object against the provided MD5 value and,
         # if they do not match, returns an error.
@@ -1194,23 +1213,27 @@ def upload_document_reference_and_decorate(document_reference, bucket_name, file
         # Our meta data
         for key, value in metadata.items():
             headers[f"x-amz-meta-{key}"] = value
+        # TODO make this async
         r = requests.put(signed_url, data=data_f, headers=headers)
         assert r.status_code == 200, (signed_url, r.text)
         logger.info(f"Successfully uploaded file \"{document_reference['file_name']}\" to GUID {guid}")
 
         # update the indexd record with urls, authz, size and hashes
-        indexd_record = index_client.get_record(guid)
+        # TODO async_get_record
+        indexd_record = await index_client.async_get_record(guid)
         assert 'rev' in indexd_record, indexd_record
         rev = indexd_record['rev']
+        # TODO - only sync version
         r = index_client.update_blank(guid, rev, hashes=hashes, size=document_reference["file_size"])
 
         urls = [f"s3://{bucket_name}/{guid}/{object_name}"]
         authz = [f'/programs/{program}/projects/{project}']
 
-        response_dict = index_client.update_record(guid=guid, version=rev,
-                                                   file_name=document_reference['file_name'],
-                                                   authz=authz, urls=urls,
-                                                   metadata=metadata)
+        #
+        response_dict = await index_client.async_update_record(guid=guid, version=rev,
+                                                               file_name=document_reference['file_name'],
+                                                               authz=authz, urls=urls,
+                                                               metadata=metadata)
         assert response_dict
         document_reference['object_id'] = guid
         return document_reference
@@ -1230,33 +1253,22 @@ def upload_document_reference_and_decorate(document_reference, bucket_name, file
 @click.pass_context
 def upload_document_reference(ctx, bucket_name, document_reference_path, program, project, credentials_file):
     """Upload data file found in DocumentReference.ndjson"""
-    endpoint = extract_endpoint(credentials_file)
-    logger.info(endpoint)
-    logger.debug(f"Read {credentials_file} endpoint {endpoint}")
-    auth = Gen3Auth(endpoint, refresh_file=credentials_file)
-    file_client = Gen3File(endpoint, auth)
-    index_client = Gen3Index(endpoint, auth)
-
-    # tic = time.perf_counter()
-    # pool_count = max(multiprocessing.cpu_count() - 1, 1)
-    # pool = multiprocessing.Pool(pool_count)
-
     with open(document_reference_path + '.tmp', "w") as output_f:
         with open(document_reference_path) as input_f:
-            for line in input_f.readlines():
-                record = json.loads(line)
-                document_reference = record['object']
-                document_reference = upload_document_reference_and_decorate(
-                    document_reference=document_reference,
-                    file_client=file_client,
-                    bucket_name=bucket_name,
-                    index_client=index_client,
-                    program=program,
-                    project=project
+            for records in chunk(input_f.readlines(), 100):
+                loop = asyncio.get_event_loop()
+                results = loop.run_until_complete(
+                    upload_document_reference_and_decorate(
+                        records=records,
+                        bucket_name=bucket_name,
+                        program=program,
+                        project=project,
+                        credentials_file=credentials_file
+                    )
                 )
-                record['object'] = document_reference
-                json.dump(record, output_f, separators=(',', ':'))
-                output_f.write('\n')
+                for record in results:
+                    json.dump(record, output_f, separators=(',', ':'))
+                    output_f.write('\n')
 
 
 @data.command(name='init')
